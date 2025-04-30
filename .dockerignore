@@ -1,0 +1,11 @@
+/target
+Dockerfile
+.dockerignore
+.git
+migrations
+.gitignore
+README.md
+.env
+.env.*
+/docs
+*.md

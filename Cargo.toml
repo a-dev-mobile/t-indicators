@@ -1,6 +1,47 @@
 [package]
 name = "t-indicators"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
+# Web framework
+axum = { version = "0.8.1", features = ["macros"] }
+tower-http = { version = "0.6.2", features = ["trace", "cors"] }
+
+# Async runtime
+tokio = { version = "1.43.0", features = ["full", "test-util"] }
+
+# Serialization
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
+toml = "0.8.20"
+
+# Protocol Buffers
+prost = "0.13.5"
+prost-types = "0.13.5"
+
+# gRPC
+tonic = { version = "0.12.3", features = ["tls", "transport", "tls-webpki-roots"] }
+
+# Logging
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
+
+# TLS
+rustls = { version = "0.23.23", features = ["ring"] }
+rustls-native-certs = "0.8.1"
+
+# Database
+clickhouse = { version = "0.13.1", features = ["time"] }
+clickhouse-derive = "0.2.0"
+sqlx = { version = "0.8.3", features = ["postgres", "runtime-tokio-native-tls", "macros", "time", "uuid", "chrono","runtime-tokio", "tls-rustls",  ] }
+
+# Misc utilities
+async-trait = "0.1.87"
+chrono = { version = "0.4.40", features = ["serde"] }
+uuid = { version = "1.15.1", features = ["v4", "serde"] }
+base64 = "0.22.1"
+
+# Optional for development
+[dev-dependencies]
+futures = "0.3.31"

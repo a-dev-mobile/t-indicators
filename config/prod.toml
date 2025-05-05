@@ -1,0 +1,21 @@
+[log]
+level = "info,sqlx=info"
+format = "text"            # Возможные значения: "json" или "text"
+
+[postgres]
+timeout = 30               # seconds
+max_connections = 40
+min_connections = 10
+max_lifetime = 1800        # 30 minutes
+idle_timeout = 600         # 10 minutes
+
+[clickhouse]
+timeout = 30   # seconds
+pool_min = 5
+pool_max = 20
+
+[indicators_updater]
+enabled = true
+interval_seconds = 300  # секунды
+start_time = "21:00:00"     # 0:00 Moscow time (UTC+3)
+end_time = "04:00:00"       # 7:00 Moscow time (UTC+3)

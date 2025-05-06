@@ -70,7 +70,7 @@ impl IndicatorRepository {
         }
 
         let client = self.connection.get_client();
-        const BATCH_SIZE: usize = 5000; 
+        const BATCH_SIZE: usize = 1000; 
 
         let total_count = indicators.len();
         let mut successful_inserts = 0;

@@ -17,7 +17,7 @@ pub struct IndicatorCalculator {
 impl IndicatorCalculator {
     pub fn new(app_state: Arc<AppState>) -> Self {
         // Параметры для расчетов
-        let batch_size = 10000;   // Обрабатываем по 10000 свечей за раз 
+        let batch_size = 10000;   // Обрабатываем свечей за раз 
         let window_size = 50;     // Размер окна для скользящих средних и RSI
         
         Self {

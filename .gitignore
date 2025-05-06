@@ -18,3 +18,4 @@ target/
 .vscode/*
 .env.local
 .env.prod
+*.log

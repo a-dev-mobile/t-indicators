@@ -1,23 +1,24 @@
 
 // File: src/services/indicators/calculator.rs
 use crate::app_state::models::AppState;
-use crate::db::clickhouse::models::indicator::{DbCandleConverted, DbIndicator};
+use crate::db::clickhouse::models::indicator::{DbCandleConverted, DbCandleRaw, DbIndicator};
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 pub struct IndicatorCalculator {
     app_state: Arc<AppState>,
-    batch_size: i64,
+    batch_size: usize,
     window_size: usize,
 }
 
 impl IndicatorCalculator {
     pub fn new(app_state: Arc<AppState>) -> Self {
         // Параметры для расчетов
-        let batch_size = 86400; // Обрабатываем по 1 дню (86400 секунд)
-        let window_size = 50;   // Размер окна для скользящих средних и RSI (должен быть > 14)
+        let batch_size = 10000;   // Обрабатываем по 10000 свечей за раз 
+        let window_size = 50;     // Размер окна для скользящих средних и RSI
         
         Self {
             app_state,
@@ -26,103 +27,116 @@ impl IndicatorCalculator {
         }
     }
     
-    /// Обрабатывает свечи указанного инструмента и рассчитывает технические индикаторы
-    /// Возвращает количество обработанных свечей
-    pub async fn process_instrument(
-        &self,
-        instrument_uid: &str,
-        start_time: i64,
-        end_time: i64,
-    ) -> Result<usize, Box<dyn std::error::Error>> {
-        info!(
-            "Processing indicators for instrument_uid={} from {} to {}",
-            instrument_uid, start_time, end_time
-        );
+    /// Очищает таблицу индикаторов перед новым расчетом
+    pub async fn truncate_indicators_table(&self) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Очистка таблицы индикаторов перед обновлением");
+        
+        // Получаем клиент ClickHouse
+        let client = self.app_state.clickhouse_service.connection.get_client();
+        
+        // SQL запрос для очистки таблицы
+        let query = "TRUNCATE TABLE market_data.tinkoff_indicators_1min";
+        
+        // Выполняем запрос
+        match client.query(query).execute().await {
+            Ok(_) => {
+                info!("Таблица индикаторов успешно очищена");
+                Ok(())
+            },
+            Err(e) => {
+                error!("Ошибка при очистке таблицы индикаторов: {}", e);
+                Err(Box::new(e))
+            }
+        }
+    }
+    
+    /// Обрабатывает все инструменты и рассчитывает технические индикаторы
+    pub async fn process_all_instruments(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        info!("Начало обработки всех инструментов");
+        
+        // Очищаем таблицу индикаторов перед обновлением
+        self.truncate_indicators_table().await?;
         
         // Получаем репозиторий индикаторов
         let indicator_repo = &self.app_state.clickhouse_service.repository_indicator;
         
-        let mut total_processed = 0;
+        // Получаем все инструменты с свечами
+        let instrument_uids = indicator_repo.get_all_instrument_uids().await?;
         
-        // Обрабатываем данные партиями по batch_size секунд
-        let mut current_start = start_time;
-        let mut last_processed_time = start_time;
-        
-        while current_start < end_time {
-            let current_end = std::cmp::min(current_start + self.batch_size, end_time);
-            
-            // Получаем предыдущие window_size свечей для правильного расчета индикаторов в начале периода
-            let window_start = if current_start > self.window_size as i64 * 60 {
-                current_start - (self.window_size as i64 * 60)
-            } else {
-                0
-            };
-            
-            // Получаем свечи из БД
-            let raw_candles = indicator_repo
-                .get_candles(instrument_uid, window_start, current_end)
-                .await?;
-            
-            if raw_candles.is_empty() {
-                debug!("No candles found for the specified period, skipping");
-                current_start = current_end;
-                continue;
-            }
-            
-            // Конвертируем сырые данные свечей в более удобный формат
-            let converted_candles: Vec<DbCandleConverted> = raw_candles
-                .into_iter()
-                .map(|raw| raw.into())
-                .collect();
-            
-            if converted_candles.is_empty() {
-                debug!("No valid candles after conversion, skipping");
-                current_start = current_end;
-                continue;
-            }
-            
-            // Определяем, какие свечи относятся к окну предварительных данных
-            let window_end_idx = converted_candles
-                .iter()
-                .position(|c| c.time >= current_start)
-                .unwrap_or(0);
-            
-            // Рассчитываем индикаторы
-            let indicators = self.calculate_indicators(&converted_candles, window_end_idx);
-            
-            if indicators.is_empty() {
-                debug!("No indicators calculated, skipping");
-                current_start = current_end;
-                continue;
-            }
-            
-            // Определяем последнее обработанное время
-            if let Some(last) = indicators.last() {
-                last_processed_time = last.time;
-            }
-            
-            // Вставляем рассчитанные индикаторы в БД
-            let inserted = indicator_repo.insert_indicators(indicators).await?;
-            
-            info!(
-                "Inserted {} indicators for instrument_uid={} from {} to {}",
-                inserted, instrument_uid, current_start, current_end
-            );
-            
-            total_processed += inserted as usize;
-            
-            // Обновляем на следующую партию
-            current_start = current_end;
+        if instrument_uids.is_empty() {
+            info!("Инструменты для обработки не найдены");
+            return Ok(0);
         }
         
-        // Обновляем статус обработки
-        indicator_repo
-            .update_status(instrument_uid, last_processed_time)
-            .await?;
+        info!("Найдено {} инструментов для обработки", instrument_uids.len());
+        
+        let mut total_processed = 0;
+        
+        // Обработка каждого инструмента
+        for (index, instrument_uid) in instrument_uids.iter().enumerate() {
+            info!(
+                "Обработка инструмента {}/{}: {}",
+                index + 1,
+                instrument_uids.len(),
+                instrument_uid
+            );
+            
+            // Получаем все свечи для инструмента
+            let mut offset = 0;
+            let mut processed_count = 0;
+            
+            loop {
+                // Получаем партию свечей из БД (с учетом дополнительного окна для расчета)
+                let raw_candles = indicator_repo
+                    .get_candles_batch(instrument_uid, offset, self.batch_size)
+                    .await?;
+                
+                if raw_candles.is_empty() {
+                    break;
+                }
+                
+                let batch_count = raw_candles.len();
+                
+                // Конвертируем сырые данные свечей в более удобный формат
+                let converted_candles: Vec<DbCandleConverted> = raw_candles
+                    .into_iter()
+                    .map(|raw| raw.into())
+                    .collect();
+                
+                // Рассчитываем индикаторы для партии
+                // В этом случае window_end_idx=0, так как мы собираем историю в каждой партии
+                let indicators = self.calculate_indicators(&converted_candles, 0);
+                
+                // Вставляем рассчитанные индикаторы в БД
+                let inserted = indicator_repo.insert_indicators(indicators).await?;
+                
+                processed_count += inserted as usize;
+                
+                info!(
+                    "Обработана партия: {} свечей, всего для инструмента: {} (инструмент {}/{})",
+                    batch_count, processed_count, index + 1, instrument_uids.len()
+                );
+                
+                // Увеличиваем смещение для следующей партии
+                offset += self.batch_size;
+                
+                // Если получили меньше свечей, чем размер партии, значит это последняя партия
+                if batch_count < self.batch_size {
+                    break;
+                }
+            }
+            
+            total_processed += processed_count;
+            
+            info!(
+                "Завершена обработка инструмента {}/{}: {}, обработано {} свечей",
+                index + 1, instrument_uids.len(), instrument_uid, processed_count
+            );
+        }
         
         info!(
-            "Completed processing for instrument_uid={}, total indicators: {}",
-            instrument_uid, total_processed
+            "Обработка всех инструментов завершена. Всего обработано: {} свечей",
+            total_processed
         );
         
         Ok(total_processed)

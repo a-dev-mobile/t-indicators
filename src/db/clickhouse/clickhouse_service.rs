@@ -1,16 +1,5 @@
-use crate::db::clickhouse::{
-    connection::ClickhouseConnection,
-    repository::{
-
-        indicator_repository::ClickhouseIndicatorRepository,
- 
-    },
-};
-use crate::db::clickhouse::repository::{
-
-    indicator_repository::IndicatorRepository,
-
-};
+use crate::db::clickhouse::connection::ClickhouseConnection;
+use crate::db::clickhouse::repository::indicator_repository::IndicatorRepository;
 use crate::env_config::models::app_setting::AppSettings;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -19,7 +8,7 @@ pub struct ClickhouseService {
     // Соединения
     pub connection: Arc<ClickhouseConnection>,
     // Аналитические репозитории (ClickHouse)
-    pub repository_indicator: Arc<dyn IndicatorRepository + Send + Sync>,
+    pub repository_indicator: Arc<IndicatorRepository>,
 }
 
 impl ClickhouseService {
@@ -42,10 +31,9 @@ impl ClickhouseService {
         // Инициализация аналитических репозиториев (ClickHouse)
         info!("Initialize repositories (ClickHouse)");
         
-
-        let indicator_repository = Arc::new(ClickhouseIndicatorRepository::new(
+        let indicator_repository = Arc::new(IndicatorRepository::new(
             clickhouse_connection.clone(),
-        )) as Arc<dyn IndicatorRepository + Send + Sync>;
+        ));
         
         info!("Database service initialized successfully");
         

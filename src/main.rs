@@ -166,7 +166,10 @@ async fn initialize_background_services(app_state: Arc<AppState>) {
     }
     
     // Запуск планировщика для регулярных обновлений
-    indicators_scheduler.start().await;
+    match indicators_scheduler.trigger_update().await {
+        Ok(count) => info!("Scheduled indicators update completed: {} instruments processed", count),
+        Err(err) => error!("Failed to perform scheduled indicators update: {}", err),
+    }
     
     info!("Background services initialized successfully");
 }

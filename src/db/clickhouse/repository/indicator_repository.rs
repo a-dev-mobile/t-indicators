@@ -16,50 +16,7 @@ impl IndicatorRepository {
         Self { connection }
     }
 
-    pub async fn get_candles_batch(
-        &self,
-        instrument_uid: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<DbCandleRaw>, clickhouse::error::Error> {
-        let client = self.connection.get_client();
-
-        let query = format!(
-            "SELECT 
-            instrument_uid,
-            time,
-            open_units,
-            open_nano,
-            high_units,
-            high_nano,
-            low_units,
-            low_nano,
-            close_units,
-            close_nano,
-            volume
-        FROM market_data.tinkoff_candles_1min
-        WHERE instrument_uid = '{}'
-        ORDER BY time ASC
-        LIMIT {} OFFSET {}",
-            instrument_uid, limit, offset
-        );
-
-        debug!(
-            "Получение партии свечей для instrument_uid={} (limit={}, offset={})",
-            instrument_uid, limit, offset
-        );
-
-        let result = client.query(&query).fetch_all::<DbCandleRaw>().await?;
-
-        debug!(
-            "Получено {} свечей для instrument_uid={}",
-            result.len(),
-            instrument_uid
-        );
-
-        Ok(result)
-    }
-
+    
     pub async fn get_candles_after_time(
         &self,
         instrument_uid: &str,
@@ -67,7 +24,10 @@ impl IndicatorRepository {
         limit: usize,
     ) -> Result<Vec<DbCandleRaw>, clickhouse::error::Error> {
         let client = self.connection.get_client();
-
+        
+        // Apply a hard limit to avoid memory issues
+        let safe_limit = std::cmp::min(limit, 2000);
+        
         let query = format!(
             "SELECT 
                 instrument_uid,
@@ -85,12 +45,12 @@ impl IndicatorRepository {
             WHERE instrument_uid = '{}' AND time > {}
             ORDER BY time ASC
             LIMIT {}",
-            instrument_uid, last_processed_time, limit
+            instrument_uid, last_processed_time, safe_limit
         );
 
         debug!(
             "Fetching candles for instrument_uid={} after time={} (limit={})",
-            instrument_uid, last_processed_time, limit
+            instrument_uid, last_processed_time, safe_limit
         );
 
         let result = client.query(&query).fetch_all::<DbCandleRaw>().await?;
@@ -112,31 +72,30 @@ impl IndicatorRepository {
             debug!("No indicators to insert");
             return Ok(0);
         }
-
+        
         let client = self.connection.get_client();
-    const BATCH_SIZE: usize = 100; // Reduced batch size to avoid partition limits
-
+        // Reduced batch size to avoid memory limits
+        const BATCH_SIZE: usize = 50;
+        
         let total_count = indicators.len();
         let mut successful_inserts = 0;
-
+        
         info!("Starting batch insertion of {} indicators", total_count);
-
-        // Обработка по пакетам
-    // Process in small batches to avoid hitting the partition limit
-    for batch_start in (0..indicators.len()).step_by(BATCH_SIZE) {
-        let batch_end = std::cmp::min(batch_start + BATCH_SIZE, indicators.len());
-        let batch = &indicators[batch_start..batch_end];
-
+        
+        // Process in small batches to avoid hitting the memory limit
+        for batch_start in (0..indicators.len()).step_by(BATCH_SIZE) {
+            let batch_end = std::cmp::min(batch_start + BATCH_SIZE, indicators.len());
+            let batch = &indicators[batch_start..batch_end];
+            
             debug!(
-            "Processing sub-batch of {} indicators, {}/{}",
+                "Processing sub-batch of {} indicators, {}/{}",
                 batch.len(),
-            successful_inserts + batch.len(),
+                successful_inserts + batch.len(),
                 total_count
             );
-
+            
             // Формируем части VALUES для SQL запроса пакетной вставки
             let mut values_parts = Vec::with_capacity(batch.len());
-
             for indicator in batch {
                 // Безопасное форматирование значений для SQL
                 // Заменяем NaN и Infinity на NULL
@@ -146,7 +105,7 @@ impl IndicatorRepository {
                 let volume_norm = format_float_safe(indicator.volume_norm);
                 let ma_diff = format_float_safe(indicator.ma_diff);
                 let price_change_15m = format_float_safe(indicator.price_change_15m);
-
+                
                 values_parts.push(format!(
                     "('{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                     indicator.instrument_uid,
@@ -170,7 +129,7 @@ impl IndicatorRepository {
                     indicator.signal_15m
                 ));
             }
-
+            
             // Формируем полный SQL-запрос для пакетной вставки
             let sql = format!(
                 "INSERT INTO market_data.tinkoff_indicators_1min 
@@ -180,22 +139,22 @@ impl IndicatorRepository {
                 VALUES {}",
                 values_parts.join(",")
             );
-
+            
             // Выполняем пакетную вставку
             match client.query(&sql).execute().await {
                 Ok(_) => {
                     // Успешная вставка пакета
-                successful_inserts += batch.len();
+                    successful_inserts += batch.len();
                     debug!(
                         "Successfully inserted batch of {} indicators ({}/{})",
                         batch.len(),
-                    successful_inserts,
+                        successful_inserts,
                         total_count
                     );
                 }
                 Err(e) => {
                     error!("Batch insertion failed: {}", e);
-                if e.to_string().contains("TOO_MANY_PARTS") {
+                    if e.to_string().contains("TOO_MANY_PARTS") || e.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
                     info!("Trying row-by-row insertion as fallback");
                     for indicator in batch {
                         let row_sql = format!(
@@ -224,13 +183,20 @@ impl IndicatorRepository {
                             format_float_safe(indicator.price_change_15m),
                             indicator.signal_15m
                         );
+                        // Add sleep to avoid overwhelming the database
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                         match client.query(&row_sql).execute().await {
                             Ok(_) => {
                                 successful_inserts += 1;
                 }
-                            Err(row_err) => {
-                                error!("Single row insertion failed: {}", row_err);
-            }
+                Err(row_err) => {
+                    error!("Single row insertion failed: {}", row_err);
+                    // If even single row insertion fails, we should consider taking a break
+                    if row_err.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
+                        info!("Memory limit still exceeded, taking a break for 5 seconds");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    }
+                }
         }
                     }
                     debug!(
@@ -244,6 +210,8 @@ impl IndicatorRepository {
                 }
             }
         }
+                    // Add a pause between batches to allow memory to be freed
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     info!(
@@ -256,25 +224,25 @@ impl IndicatorRepository {
 
     pub async fn get_all_instrument_uids(&self) -> Result<Vec<String>, clickhouse::error::Error> {
         let client = self.connection.get_client();
-
+        
         // Упрощенный подход - используем простой SQL для получения уникальных инструментов
         let query = "SELECT DISTINCT instrument_uid FROM market_data.tinkoff_candles_1min";
-
+        
         debug!("Fetching all instrument UIDs with candles");
-
+        
         // Определяем структуру для результата
         #[derive(Debug, Deserialize, clickhouse::Row)]
         struct UidRow {
             instrument_uid: String,
         }
-
+        
         let rows = client.query(query).fetch_all::<UidRow>().await?;
-
+        
         // Преобразуем результат в Vec<String>
         let result: Vec<String> = rows.into_iter().map(|row| row.instrument_uid).collect();
-
+        
         info!("Fetched {} instrument UIDs with candles", result.len());
-
+        
         Ok(result)
     }
 }

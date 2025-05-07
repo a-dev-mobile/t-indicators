@@ -17,7 +17,7 @@ pub struct IndicatorCalculator {
 impl IndicatorCalculator {
     pub fn new(app_state: Arc<AppState>) -> Self {
         // Параметры для расчетов
-        let batch_size = 10000; // Обрабатываем свечей за раз 
+        let batch_size = 1000; // Обрабатываем свечей за раз 
         let window_size = 50; // Размер окна для скользящих средних и RSI
 
         Self {
@@ -30,13 +30,10 @@ impl IndicatorCalculator {
     /// Очищает таблицу индикаторов перед новым расчетом
     pub async fn truncate_indicators_table(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Очистка таблицы индикаторов перед обновлением");
-
         // Получаем клиент ClickHouse
         let client = self.app_state.clickhouse_service.connection.get_client();
-
         // SQL запрос для очистки таблицы
         let query = "TRUNCATE TABLE market_data.tinkoff_indicators_1min";
-
         // Выполняем запрос
         match client.query(query).execute().await {
             Ok(_) => {
@@ -63,20 +60,21 @@ impl IndicatorCalculator {
 
         // Get all instruments with candles
         let instrument_uids = indicator_repo.get_all_instrument_uids().await?;
-
         if instrument_uids.is_empty() {
             info!("No instruments found for processing");
             return Ok(0);
         }
 
         info!("Found {} instruments for processing", instrument_uids.len());
-    let is_status_table_empty = self.is_status_table_empty().await?;
-    if is_status_table_empty {
-        info!("Status table is empty, performing full recalculation");
-        self.truncate_indicators_table().await?;
-    } else {
-        info!("Status table has records, continuing from last processed times");
-    }
+
+        let is_status_table_empty = self.is_status_table_empty().await?;
+        if is_status_table_empty {
+            info!("Status table is empty, performing full recalculation");
+            self.truncate_indicators_table().await?;
+        } else {
+            info!("Status table has records, continuing from last processed times");
+        }
+
         let mut total_processed = 0;
 
         // Process each instrument
@@ -89,7 +87,7 @@ impl IndicatorCalculator {
             );
 
             // Get the last processed time for this instrument
-        let mut last_processed_time = status_repo
+            let mut last_processed_time = status_repo
                 .get_last_processed_time(instrument_uid)
                 .await?
                 .unwrap_or(0); // If no record exists, start from the beginning (time 0)
@@ -108,76 +106,141 @@ impl IndicatorCalculator {
                     .await?;
 
                 if raw_candles.is_empty() {
-                debug!("No more candles found for instrument {} after time {}", instrument_uid, last_processed_time);
+                    debug!(
+                        "No more candles found for instrument {} after time {}",
+                        instrument_uid, last_processed_time
+                    );
                     break;
                 }
 
                 let batch_count = raw_candles.len();
 
                 // Update the latest time for this batch
-            let latest_time = if let Some(last_candle) = raw_candles.last() {
-                last_candle.time
-            } else {
-                continue; // Should never happen as we just checked if empty, but just in case
-            };
-            debug!("Latest time in current batch: {}", latest_time);
+                let latest_time = if let Some(last_candle) = raw_candles.last() {
+                    last_candle.time
+                } else {
+                    continue; // Should never happen as we just checked if empty, but just in case
+                };
+
+                debug!("Latest time in current batch: {}", latest_time);
+
                 // Convert raw candles to a more convenient format
-            let converted_candles: Vec<DbCandleConverted> = raw_candles
-                .into_iter()
-                .map(|raw| raw.into())
-                .collect();
-            let indicators = {
-                // Calculate indicators for the batch
-            let window_data = if processed_count == 0 && last_processed_time > 0 {
-                    // We need historical data for the first batch to calculate indicators correctly
-                self.fetch_historical_window(indicator_repo, instrument_uid, last_processed_time).await?
-                } else {
-                    Vec::new()
+                let converted_candles: Vec<DbCandleConverted> =
+                    raw_candles.into_iter().map(|raw| raw.into()).collect();
+
+                let indicators = {
+                    // Calculate indicators for the batch
+                    let window_data = if processed_count == 0 && last_processed_time > 0 {
+                        // We need historical data for the first batch to calculate indicators correctly
+                        self.fetch_historical_window(
+                            indicator_repo,
+                            instrument_uid,
+                            last_processed_time,
+                        )
+                        .await?
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Get window size before moving window_data
+                    let window_end_idx = if !window_data.is_empty() {
+                        window_data.len()
+                    } else {
+                        0
+                    };
+
+                    // Combine historical window with new data if needed
+                    let calculation_data = if !window_data.is_empty() {
+                        let mut combined = window_data;
+                        combined.extend(converted_candles.iter().cloned());
+                        combined
+                    } else {
+                        converted_candles.clone()
+                    };
+                    self.calculate_indicators(&calculation_data, window_end_idx)
                 };
-
-                // Get window size before moving window_data
-                let window_end_idx = if !window_data.is_empty() { window_data.len() } else { 0 };
-
-                // Combine historical window with new data if needed
-                let calculation_data = if !window_data.is_empty() {
-                    let mut combined = window_data;
-                    combined.extend(converted_candles.iter().cloned());
-                    combined
-                } else {
-                    converted_candles.clone()
-                };
-                self.calculate_indicators(&calculation_data, window_end_idx)
-            };
-                // Insert calculated indicators
-                let inserted = indicator_repo.insert_indicators(indicators).await?;
-
-                processed_count += inserted as usize;
-
+                
+                // Insert calculated indicators - use smaller chunks for insertion
+                if !indicators.is_empty() {
+                    // Insert in chunks of 500 to reduce memory pressure
+                    const INSERT_CHUNK_SIZE: usize = 500;
+                    
+                    for chunk_start in (0..indicators.len()).step_by(INSERT_CHUNK_SIZE) {
+                        let chunk_end = std::cmp::min(chunk_start + INSERT_CHUNK_SIZE, indicators.len());
+                        let chunk = indicators[chunk_start..chunk_end].to_vec();
+                        
+                        match indicator_repo.insert_indicators(chunk).await {
+                            Ok(inserted) => {
+                                processed_count += inserted as usize;
+                                debug!("Inserted chunk of {} indicators", inserted);
+                            }
+                            Err(e) => {
+                                error!("Failed to insert indicators chunk: {}", e);
+                                if e.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
+                                    // Add a pause to let the system recover
+                                    info!("Memory limit exceeded, pausing for 5 seconds before retry...");
+                                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                                    
+                                    // Try again with a smaller chunk
+                                    let smaller_chunk_size = INSERT_CHUNK_SIZE / 2;
+                                    for smaller_chunk_start in (chunk_start..chunk_end).step_by(smaller_chunk_size) {
+                                        let smaller_chunk_end = std::cmp::min(smaller_chunk_start + smaller_chunk_size, chunk_end);
+                                        let smaller_chunk = indicators[smaller_chunk_start..smaller_chunk_end].to_vec();
+                                        
+                                        match indicator_repo.insert_indicators(smaller_chunk).await {
+                                            Ok(inserted) => {
+                                                processed_count += inserted as usize;
+                                                debug!("Inserted smaller chunk of {} indicators", inserted);
+                                            }
+                                            Err(inner_e) => {
+                                                error!("Failed to insert smaller indicators chunk: {}", inner_e);
+                                                // Continue to the next smaller chunk even if this one fails
+                                            }
+                                        }
+                                        
+                                        // Add a small pause between chunks
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                    }
+                                } else {
+                                    // For other errors, propagate up
+                                    return Err(Box::new(e));
+                                }
+                            }
+                        }
+                    }
+                }
+                
                 info!(
                     "Processed batch: {} candles, total for instrument: {} (instrument {}/{})",
-                batch_count, processed_count, index + 1, instrument_uids.len()
+                    batch_count, processed_count, index + 1, instrument_uids.len()
                 );
-
+                
                 // Update the last processed time in the database
-            info!("Updating last processed time for {} from {} to {}", instrument_uid, last_processed_time, latest_time);
-            status_repo.update_last_processed_time(instrument_uid, latest_time).await?;
-            
-
-            last_processed_time = latest_time;
+                info!("Updating last processed time for {} from {} to {}", instrument_uid, last_processed_time, latest_time);
+                status_repo.update_last_processed_time(instrument_uid, latest_time).await?;
+                
+                last_processed_time = latest_time;
+                
                 // If we received fewer candles than the batch size, we're done with this instrument
                 if batch_count < self.batch_size {
                     break;
                 }
+                
+                // Add a small pause between batches to give the database a break
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
-
+            
             total_processed += processed_count;
-
+            
             info!(
                 "Completed processing for instrument {}/{}: {}, processed {} candles",
-            index + 1, instrument_uids.len(), instrument_uid, processed_count
+                index + 1, instrument_uids.len(), instrument_uid, processed_count
             );
+            
+            // Add a pause between instruments to avoid overloading ClickHouse
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
-
+        
         info!(
             "All instrument processing completed. Total processed: {} candles",
             total_processed
@@ -185,20 +248,19 @@ impl IndicatorCalculator {
 
         Ok(total_processed)
     }
-
-/// Checks if the tinkoff_indicators_status table is empty
-async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>> {
-    let pool = self.app_state.postgres_service.connection.get_pool();
     
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_data.tinkoff_indicators_status")
-        .fetch_one(pool)
-        .await?;
+    /// Checks if the tinkoff_indicators_status table is empty
+    async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let pool = self.app_state.postgres_service.connection.get_pool();
+        
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM market_data.tinkoff_indicators_status")
+            .fetch_one(pool)
+            .await?;
+        
+        Ok(count == 0)
+    }
     
-    Ok(count == 0)
-}
-
-
-    /// Fetches historical data for calculating indicators
+    /// Fetches historical data for calculating indicators - modified to limit the amount of data fetched
     async fn fetch_historical_window(
         &self,
         repo: &Arc<IndicatorRepository>,
@@ -206,14 +268,14 @@ async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>
         current_time: i64,
     ) -> Result<Vec<DbCandleConverted>, Box<dyn std::error::Error>> {
         // Determine how much historical data we need for the calculations
-        // This should be at least as large as the largest window used in calculations
+        // Ensure we don't request too much data at once
         let window_size = self.window_size;
-
+        
         debug!(
             "Fetching historical window of size {} for instrument {} before time {}",
             window_size, instrument_uid, current_time
         );
-
+        
         // Query to get the last N candles before the current time
         let query = format!(
             "SELECT 
@@ -234,27 +296,26 @@ async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>
             LIMIT {}",
             instrument_uid, current_time, window_size
         );
-
+        
         let client = repo.connection.get_client();
         let result = client.query(&query).fetch_all::<DbCandleRaw>().await?;
-
+        
         debug!(
             "Retrieved {} historical candles for instrument {} before time {}",
             result.len(),
             instrument_uid,
             current_time
         );
-
+        
         // Convert and reverse to get candles in ascending time order
         let mut converted: Vec<DbCandleConverted> =
             result.into_iter().map(|raw| raw.into()).collect();
-
         converted.reverse();
-
+        
         Ok(converted)
     }
-    /// Рассчитывает технические индикаторы на основе конвертированных свечей
-    /// window_end_idx - индекс первой свечи после окна предварительных данных
+
+    /// Calculate technical indicators for candles
     fn calculate_indicators(
         &self,
         candles: &[DbCandleConverted],
@@ -264,14 +325,13 @@ async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>
             debug!("Not enough candles for indicator calculation");
             return Vec::new();
         }
-
+        
         let mut result = Vec::with_capacity(candles.len() - window_end_idx);
-
         // Окна для расчета скользящих средних и RSI
         let mut prices_window: VecDeque<f64> = VecDeque::with_capacity(self.window_size);
         let mut rsi_gains: VecDeque<f64> = VecDeque::with_capacity(14);
         let mut rsi_losses: VecDeque<f64> = VecDeque::with_capacity(14);
-
+        
         // Предварительное заполнение окон данными для расчета
         for i in 0..window_end_idx {
             if i > 0 {
@@ -284,34 +344,33 @@ async fn is_status_table_empty(&self) -> Result<bool, Box<dyn std::error::Error>
                     rsi_gains.push_back(0.0);
                     rsi_losses.push_back(-price_change);
                 }
-
                 // Ограничиваем размер окна для RSI
                 if rsi_gains.len() > 14 {
                     rsi_gains.pop_front();
                     rsi_losses.pop_front();
                 }
             }
-
+            
             prices_window.push_back(candles[i].close_price);
             if prices_window.len() > self.window_size {
                 prices_window.pop_front();
             }
         }
-
+        
         // Сохраняем предыдущую ма_10 и ма_30 для определения пересечений
         let mut prev_ma_10 = calculate_sma(prices_window.iter().cloned().collect::<Vec<f64>>(), 10);
         let mut prev_ma_30 = calculate_sma(prices_window.iter().cloned().collect::<Vec<f64>>(), 30);
-
+        
         // Расчет стандартного отклонения объемов для определения аномалий
         let mut volume_stats = VolumeStatistics::new(50);
         for i in 0..window_end_idx {
             volume_stats.add(candles[i].volume as f64);
         }
-
+        
         // Основной расчет индикаторов для каждой свечи
         for i in window_end_idx..candles.len() {
             let candle = &candles[i];
-
+            
             // Расчет RSI
             if i > 0 {
                 let price_change = candle.close_price - candles[i - 1].close_price;

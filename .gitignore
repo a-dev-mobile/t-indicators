@@ -19,3 +19,4 @@ target/
 .env.local
 .env.prod
 *.log
+makefile

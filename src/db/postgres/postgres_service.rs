@@ -1,10 +1,9 @@
 use crate::db::postgres::repository::health_check_repository::TraitHealthCheckRepository;
 
-
+use crate::db::postgres::repository::indicator_status_repository::{StructIndicatorStatusRepository, TraitIndicatorStatusRepository};
 use crate::db::postgres::{
     connection::PostgresConnection,
     repository::health_check_repository::StructHealthCheckRepository,
-
 };
 use crate::env_config::models::app_setting::AppSettings;
 use std::sync::Arc;
@@ -16,8 +15,7 @@ pub struct PostgresService {
 
     // Operational repositories (PostgreSQL)
     pub repository_health_check: Arc<dyn TraitHealthCheckRepository + Send + Sync>,
-
-
+    pub repository_indicator_status: Arc<dyn TraitIndicatorStatusRepository + Send + Sync>,
 }
 
 impl PostgresService {
@@ -45,14 +43,16 @@ impl PostgresService {
         ))
             as Arc<dyn TraitHealthCheckRepository + Send + Sync>;
 
-     
+        let indicator_status_repository = Arc::new(StructIndicatorStatusRepository::new(
+            postgres_connection.clone(),
+        ))
+            as Arc<dyn TraitIndicatorStatusRepository + Send + Sync>;
 
         info!("PostgreSQL service initialized successfully");
         Ok(Self {
             connection: postgres_connection,
             repository_health_check: health_check_repository,
-
-          
+            repository_indicator_status: indicator_status_repository,
         })
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 pub struct IndicatorRepository {
-    connection: Arc<ClickhouseConnection>,
+    pub connection: Arc<ClickhouseConnection>,
 }
 
 impl IndicatorRepository {
@@ -60,6 +60,50 @@ impl IndicatorRepository {
         Ok(result)
     }
 
+    pub async fn get_candles_after_time(
+        &self,
+        instrument_uid: &str,
+        last_processed_time: i64,
+        limit: usize,
+    ) -> Result<Vec<DbCandleRaw>, clickhouse::error::Error> {
+        let client = self.connection.get_client();
+
+        let query = format!(
+            "SELECT 
+                instrument_uid,
+                time,
+                open_units,
+                open_nano,
+                high_units,
+                high_nano,
+                low_units,
+                low_nano,
+                close_units,
+                close_nano,
+                volume
+            FROM market_data.tinkoff_candles_1min
+            WHERE instrument_uid = '{}' AND time > {}
+            ORDER BY time ASC
+            LIMIT {}",
+            instrument_uid, last_processed_time, limit
+        );
+
+        debug!(
+            "Fetching candles for instrument_uid={} after time={} (limit={})",
+            instrument_uid, last_processed_time, limit
+        );
+
+        let result = client.query(&query).fetch_all::<DbCandleRaw>().await?;
+
+        debug!(
+            "Retrieved {} candles for instrument_uid={} after time={}",
+            result.len(),
+            instrument_uid,
+            last_processed_time
+        );
+
+        Ok(result)
+    }
     pub async fn insert_indicators(
         &self,
         indicators: Vec<DbIndicator>,
@@ -70,7 +114,7 @@ impl IndicatorRepository {
         }
 
         let client = self.connection.get_client();
-        const BATCH_SIZE: usize = 1000; 
+        const BATCH_SIZE: usize = 1000;
 
         let total_count = indicators.len();
         let mut successful_inserts = 0;

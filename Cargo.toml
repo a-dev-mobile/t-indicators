@@ -25,7 +25,7 @@ tonic = { version = "0.12.3", features = ["tls", "transport", "tls-webpki-roots"
 
 # Logging
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json"] }
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter", "json", "chrono"] }
 
 # TLS
 rustls = { version = "0.23.23", features = ["ring"] }

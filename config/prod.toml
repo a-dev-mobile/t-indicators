@@ -1,7 +1,6 @@
 [log]
-level = "info,sqlx=info"
-format = "text"            # Возможные значения: "json" или "text"
-
+level = "info,sqlx=warn"
+format = "text" # "json"
 [postgres]
 timeout = 30               # seconds
 max_connections = 40

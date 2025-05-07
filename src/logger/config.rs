@@ -41,7 +41,8 @@ pub fn init_logger(log_level: &str, log_format: &str) -> Result<(), Error> {
         // Production mode without timestamps
         let builder = tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_target(false)
+            .with_target(true) 
+			.with_level(true) 
             .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
             .without_time();
             

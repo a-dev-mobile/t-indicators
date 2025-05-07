@@ -114,8 +114,7 @@ impl IndicatorRepository {
         }
 
         let client = self.connection.get_client();
-        const BATCH_SIZE: usize = 1000;
-    const MAX_PARTITIONS_PER_BATCH: usize = 50; // Keep well under the 100 limit
+    const BATCH_SIZE: usize = 100; // Reduced batch size to avoid partition limits
 
         let total_count = indicators.len();
         let mut successful_inserts = 0;
@@ -123,62 +122,15 @@ impl IndicatorRepository {
         info!("Starting batch insertion of {} indicators", total_count);
 
         // Обработка по пакетам
-    let mut grouped_indicators: std::collections::HashMap<String, Vec<DbIndicator>> = 
-        std::collections::HashMap::new();
-    for indicator in indicators {
-        grouped_indicators
-            .entry(indicator.instrument_uid.clone())
-            .or_insert_with(Vec::new)
-            .push(indicator);
-    }
-    let mut partition_batch = Vec::new();
-    let mut current_batch_partitions = 0;
-    for (instrument_uid, indicators_for_instrument) in grouped_indicators {
-        if current_batch_partitions >= MAX_PARTITIONS_PER_BATCH && !partition_batch.is_empty() {
-            let inserted = self.process_indicator_batch(&client, partition_batch, total_count, successful_inserts).await?;
-            successful_inserts += inserted;
-            partition_batch = Vec::new();
-            current_batch_partitions = 0;
-        }
-        partition_batch.push((instrument_uid, indicators_for_instrument));
-        current_batch_partitions += 1;
-    }
-    if !partition_batch.is_empty() {
-        let inserted = self.process_indicator_batch(&client, partition_batch, total_count, successful_inserts).await?;
-        successful_inserts += inserted;
-    }
-    info!(
-        "Insertion complete. Successfully inserted {} indicators",
-        successful_inserts
-    );
-    Ok(successful_inserts)
-}
-async fn process_indicator_batch(
-    &self,
-    client: &clickhouse::Client,
-    partition_batch: Vec<(String, Vec<DbIndicator>)>,
-    total_count: usize,
-    current_total: u64,
-) -> Result<u64, clickhouse::error::Error> {
-    const BATCH_SIZE: usize = 1000;
-    let mut successful_inserts = 0;
-    let mut all_indicators = Vec::new();
-    for (_, indicators) in partition_batch.iter() {
-        all_indicators.extend(indicators.iter().cloned());
-    }
-    debug!(
-        "Processing batch with {} partitions, {} total indicators", 
-        partition_batch.len(),
-        all_indicators.len()
-    );
-    for batch_start in (0..all_indicators.len()).step_by(BATCH_SIZE) {
-        let batch_end = std::cmp::min(batch_start + BATCH_SIZE, all_indicators.len());
-        let batch = &all_indicators[batch_start..batch_end];
+    // Process in small batches to avoid hitting the partition limit
+    for batch_start in (0..indicators.len()).step_by(BATCH_SIZE) {
+        let batch_end = std::cmp::min(batch_start + BATCH_SIZE, indicators.len());
+        let batch = &indicators[batch_start..batch_end];
 
             debug!(
             "Processing sub-batch of {} indicators, {}/{}",
                 batch.len(),
-            current_total + successful_inserts + batch.len() as u64,
+            successful_inserts + batch.len(),
                 total_count
             );
 
@@ -233,28 +185,74 @@ async fn process_indicator_batch(
             match client.query(&sql).execute().await {
                 Ok(_) => {
                     // Успешная вставка пакета
-                    successful_inserts += batch.len() as u64;
+                successful_inserts += batch.len();
                     debug!(
                         "Successfully inserted batch of {} indicators ({}/{})",
                         batch.len(),
-                    current_total + successful_inserts,
+                    successful_inserts,
                         total_count
                     );
                 }
                 Err(e) => {
                     error!("Batch insertion failed: {}", e);
+                if e.to_string().contains("TOO_MANY_PARTS") {
+                    info!("Trying row-by-row insertion as fallback");
+                    for indicator in batch {
+                        let row_sql = format!(
+                            "INSERT INTO market_data.tinkoff_indicators_1min 
+                            (instrument_uid, time, open_price, high_price, low_price, close_price, volume, 
+                            rsi_14, ma_10, ma_30, volume_norm, ma_diff, ma_cross, rsi_zone, volume_anomaly, 
+                            hour_of_day, day_of_week, price_change_15m, signal_15m) 
+                            VALUES ('{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                            indicator.instrument_uid,
+                            indicator.time,
+                            indicator.open_price,
+                            indicator.high_price,
+                            indicator.low_price,
+                            indicator.close_price,
+                            indicator.volume,
+                            format_float_safe(indicator.rsi_14),
+                            format_float_safe(indicator.ma_10),
+                            format_float_safe(indicator.ma_30),
+                            format_float_safe(indicator.volume_norm),
+                            format_float_safe(indicator.ma_diff),
+                            indicator.ma_cross,
+                            indicator.rsi_zone,
+                            indicator.volume_anomaly,
+                            indicator.hour_of_day,
+                            indicator.day_of_week,
+                            format_float_safe(indicator.price_change_15m),
+                            indicator.signal_15m
+                        );
+                        match client.query(&row_sql).execute().await {
+                            Ok(_) => {
+                                successful_inserts += 1;
+                }
+                            Err(row_err) => {
+                                error!("Single row insertion failed: {}", row_err);
+            }
+        }
+                    }
+                    debug!(
+                        "Completed row-by-row insertion for batch, total successful: {}/{}",
+                        successful_inserts,
+                        total_count
+        );
+                } else {
+                    // For other errors, return immediately
                     return Err(e);
                 }
             }
         }
-
-        info!(
-            "Insertion complete. Successfully inserted {} indicators",
-            successful_inserts
-        );
-
-        Ok(successful_inserts)
     }
+
+    info!(
+        "Insertion complete. Successfully inserted {} indicators",
+        successful_inserts
+    );
+
+    Ok(successful_inserts as u64)
+}
 
     pub async fn get_all_instrument_uids(&self) -> Result<Vec<String>, clickhouse::error::Error> {
         let client = self.connection.get_client();

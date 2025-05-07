@@ -1,5 +1,5 @@
 [log]
-level = "info,sqlx=warn"
+level = "debug,sqlx=debug"
 format = "text" # "json"
 [postgres]
 timeout = 30               # seconds

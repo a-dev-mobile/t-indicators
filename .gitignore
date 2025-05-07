@@ -20,3 +20,4 @@ target/
 .env.prod
 *.log
 makefile
+readme.md

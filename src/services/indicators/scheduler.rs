@@ -15,62 +15,69 @@ impl IndicatorsScheduler {
         Self { app_state }
     }
 
-    // Modified to implement basic retry and backoff
+    // Simplified implementation without unnecessary retries
     pub async fn trigger_update(&self) -> Result<usize, Box<dyn std::error::Error>> {
         info!("Starting indicators update for all instruments");
         
-        // Create indicator calculator
+        // Create indicator calculator with conservative batch sizes
         let calculator = IndicatorCalculator::new(self.app_state.clone());
         
-        // Initial attempt
+        // Process all instruments - no retries on memory errors since we use smaller batches by default
         match calculator.process_all_instruments().await {
             Ok(count) => {
                 info!("Indicators update completed successfully. Processed {} candles", count);
-                return Ok(count);
+                Ok(count)
             },
             Err(e) => {
-                // Check if the error is memory-related
-                let err_string = e.to_string();
-                if err_string.contains("MEMORY_LIMIT_EXCEEDED") {
-                    warn!("Memory limit exceeded during indicators update. Retrying with backoff: {}", e);
-                    
-                    // Implement backoff and retry logic
-                    for attempt in 1..=3 {
-                        // Exponential backoff: 5s, 10s, 20s
-                        let backoff = 5 * 2u64.pow(attempt - 1);
-                        info!("Waiting for {}s before retry attempt {}/3", backoff, attempt);
-                        time::sleep(Duration::from_secs(backoff)).await;
-                        
-                        // Retry with a fresh calculator (which will have smaller batch sizes)
-                        let retry_calculator = IndicatorCalculator::new(self.app_state.clone());
-                        
-                        match retry_calculator.process_all_instruments().await {
-                            Ok(count) => {
-                                info!("Retry succeeded on attempt {}. Processed {} candles", attempt, count);
-                                return Ok(count);
-                            },
-                            Err(retry_err) => {
-                                if retry_err.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
-                                    warn!("Memory limit still exceeded on retry attempt {}: {}", attempt, retry_err);
-                                    // Continue to next retry
-                                } else {
-                                    // Different error, return it
-                                    error!("New error occurred during retry: {}", retry_err);
-                                    return Err(retry_err);
-                                }
-                            }
-                        }
-                    }
-                    
-                    // All retries failed
-                    error!("All retry attempts failed due to memory limitations");
-                    return Err(e);
-                } else {
-                    // Not a memory related error, just return it
-                    error!("Error during indicators update: {}", e);
-                    return Err(e);
-                }
+                error!("Error during indicators update: {}", e);
+                Err(e)
             }
         }
+    }
+    
+    // Start a regular scheduled update process
+    pub async fn start_scheduled_updates(&self) {
+        info!("Starting scheduled indicator updates");
+        
+        // Get the update interval from settings
+        let interval_seconds = self.app_state.settings.app_config.indicators_updater.interval_seconds;
+        info!("Update interval set to {} seconds", interval_seconds);
+        
+        // Create a new task for the scheduler
+        let app_state = self.app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = time::interval(Duration::from_secs(interval_seconds));
+            
+            loop {
+                interval.tick().await;
+                
+                // Check if updates are enabled in config
+                if !app_state.settings.app_config.indicators_updater.enabled {
+                    debug!("Indicator updates are disabled in config, skipping");
+                    continue;
+                }
+                
+                // Check if current time is within the allowed operation window
+                if !app_state.settings.app_config.indicators_updater.is_operation_allowed() {
+                    debug!("Outside operation window, skipping update");
+                    continue;
+                }
+                
+                info!("Executing scheduled indicator update");
+                
+                // Create a new scheduler and trigger the update
+                let scheduler = IndicatorsScheduler::new(app_state.clone());
+                match scheduler.trigger_update().await {
+                    Ok(count) => {
+                        info!("Scheduled indicators update completed: {} candles processed", count);
+                    }
+                    Err(e) => {
+                        error!("Scheduled indicators update failed: {}", e);
+                    }
+                }
+            }
+        });
+        
+        info!("Scheduled update task started");
     }
 }

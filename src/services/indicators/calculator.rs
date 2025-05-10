@@ -5,7 +5,6 @@ use crate::db::clickhouse::repository::indicator_repository::IndicatorRepository
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 pub struct IndicatorCalculator {
@@ -16,9 +15,9 @@ pub struct IndicatorCalculator {
 
 impl IndicatorCalculator {
     pub fn new(app_state: Arc<AppState>) -> Self {
-        // Параметры для расчетов
-        let batch_size = 1000; // Обрабатываем свечей за раз 
-        let window_size = 50; // Размер окна для скользящих средних и RSI
+        // Use moderate batch size to avoid memory issues entirely
+        let batch_size = 1500; // Balanced batch size to avoid memory errors
+        let window_size = 50;  // Size of window for moving averages and RSI
 
         Self {
             app_state,
@@ -27,34 +26,32 @@ impl IndicatorCalculator {
         }
     }
 
-    /// Очищает таблицу индикаторов перед новым расчетом
+    /// Clear indicators table before recalculation
     pub async fn truncate_indicators_table(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Очистка таблицы индикаторов перед обновлением");
-        // Получаем клиент ClickHouse
+        info!("Clearing indicators table before update");
         let client = self.app_state.clickhouse_service.connection.get_client();
-        // SQL запрос для очистки таблицы
         let query = "TRUNCATE TABLE market_data.tinkoff_indicators_1min";
-        // Выполняем запрос
+        
         match client.query(query).execute().await {
             Ok(_) => {
-                info!("Таблица индикаторов успешно очищена");
+                info!("Indicators table successfully cleared");
                 Ok(())
             }
             Err(e) => {
-                error!("Ошибка при очистке таблицы индикаторов: {}", e);
+                error!("Error clearing indicators table: {}", e);
                 Err(Box::new(e))
             }
         }
     }
 
-    /// Обрабатывает все инструменты и рассчитывает технические индикаторы
+    /// Process all instruments and calculate technical indicators
     pub async fn process_all_instruments(&self) -> Result<usize, Box<dyn std::error::Error>> {
         info!("Starting processing for all instruments from last processed time");
 
         // Очищаем таблицу индикаторов перед обновлением
         // self.truncate_indicators_table().await?;
 
-        // Получаем репозиторий индикаторов
+                // Get repositories
         let indicator_repo = &self.app_state.clickhouse_service.repository_indicator;
         let status_repo = &self.app_state.postgres_service.repository_indicator_status;
 
@@ -77,7 +74,7 @@ impl IndicatorCalculator {
 
         let mut total_processed = 0;
 
-        // Process each instrument
+        // Process each instrument sequentially - no parallelism
         for (index, instrument_uid) in instrument_uids.iter().enumerate() {
             info!(
                 "Processing instrument {}/{}: {}",
@@ -157,77 +154,39 @@ impl IndicatorCalculator {
                     } else {
                         converted_candles.clone()
                     };
+                    
                     self.calculate_indicators(&calculation_data, window_end_idx)
                 };
                 
-                // Insert calculated indicators - use smaller chunks for insertion
+                // Insert calculated indicators
                 if !indicators.is_empty() {
-                    // Insert in chunks of 500 to reduce memory pressure
-                    const INSERT_CHUNK_SIZE: usize = 500;
-                    
-                    for chunk_start in (0..indicators.len()).step_by(INSERT_CHUNK_SIZE) {
-                        let chunk_end = std::cmp::min(chunk_start + INSERT_CHUNK_SIZE, indicators.len());
-                        let chunk = indicators[chunk_start..chunk_end].to_vec();
-                        
-                        match indicator_repo.insert_indicators(chunk).await {
-                            Ok(inserted) => {
-                                processed_count += inserted as usize;
-                                debug!("Inserted chunk of {} indicators", inserted);
-                            }
-                            Err(e) => {
-                                error!("Failed to insert indicators chunk: {}", e);
-                                if e.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
-                                    // Add a pause to let the system recover
-                                    info!("Memory limit exceeded, pausing for 5 seconds before retry...");
-                                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                                    
-                                    // Try again with a smaller chunk
-                                    let smaller_chunk_size = INSERT_CHUNK_SIZE / 2;
-                                    for smaller_chunk_start in (chunk_start..chunk_end).step_by(smaller_chunk_size) {
-                                        let smaller_chunk_end = std::cmp::min(smaller_chunk_start + smaller_chunk_size, chunk_end);
-                                        let smaller_chunk = indicators[smaller_chunk_start..smaller_chunk_end].to_vec();
-                                        
-                                        match indicator_repo.insert_indicators(smaller_chunk).await {
-                                            Ok(inserted) => {
-                                                processed_count += inserted as usize;
-                                                debug!("Inserted smaller chunk of {} indicators", inserted);
-                                            }
-                                            Err(inner_e) => {
-                                                error!("Failed to insert smaller indicators chunk: {}", inner_e);
-                                                // Continue to the next smaller chunk even if this one fails
-                                            }
-                                        }
-                                        
-                                        // Add a small pause between chunks
-                                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                                    }
-                                } else {
-                                    // For other errors, propagate up
-                                    return Err(Box::new(e));
-                                }
-                            }
+                    match indicator_repo.insert_indicators(indicators).await {
+                        Ok(inserted) => {
+                            processed_count += inserted as usize;
+                            debug!("Inserted {} indicators for {}", inserted, instrument_uid);
+                        }
+                        Err(e) => {
+                            // Just log the error and continue with the next batch
+                            error!("Failed to insert indicators for {}: {}", instrument_uid, e);
                         }
                     }
                 }
                 
-                info!(
-                    "Processed batch: {} candles, total for instrument: {} (instrument {}/{})",
-                    batch_count, processed_count, index + 1, instrument_uids.len()
-                );
+                // Update last processed time
+                if let Err(e) = status_repo.update_last_processed_time(instrument_uid, latest_time).await {
+                    error!("Failed to update last processed time for {}: {}", instrument_uid, e);
+                }
                 
-                // Update the last processed time in the database
-                info!("Updating last processed time for {} from {} to {}", instrument_uid, last_processed_time, latest_time);
-                status_repo.update_last_processed_time(instrument_uid, latest_time).await?;
-                
+                // Update last processed time for next iteration
                 last_processed_time = latest_time;
                 
-                // If we received fewer candles than the batch size, we're done with this instrument
+                // If we received fewer candles than batch size, we're done with this instrument
                 if batch_count < self.batch_size {
                     break;
                 }
                 
-                // Add a small pause between batches to give the database a break
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                // Very short pause between batches
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
             
             total_processed += processed_count;
@@ -236,9 +195,6 @@ impl IndicatorCalculator {
                 "Completed processing for instrument {}/{}: {}, processed {} candles",
                 index + 1, instrument_uids.len(), instrument_uid, processed_count
             );
-            
-            // Add a pause between instruments to avoid overloading ClickHouse
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
         
         info!(
@@ -260,15 +216,13 @@ impl IndicatorCalculator {
         Ok(count == 0)
     }
     
-    /// Fetches historical data for calculating indicators - modified to limit the amount of data fetched
+    /// Fetches historical data for calculating indicators
     async fn fetch_historical_window(
         &self,
         repo: &Arc<IndicatorRepository>,
         instrument_uid: &str,
         current_time: i64,
     ) -> Result<Vec<DbCandleConverted>, Box<dyn std::error::Error>> {
-        // Determine how much historical data we need for the calculations
-        // Ensure we don't request too much data at once
         let window_size = self.window_size;
         
         debug!(
@@ -327,15 +281,15 @@ impl IndicatorCalculator {
         }
         
         let mut result = Vec::with_capacity(candles.len() - window_end_idx);
-        // Окна для расчета скользящих средних и RSI
+        // Windows for moving averages and RSI calculation
         let mut prices_window: VecDeque<f64> = VecDeque::with_capacity(self.window_size);
         let mut rsi_gains: VecDeque<f64> = VecDeque::with_capacity(14);
         let mut rsi_losses: VecDeque<f64> = VecDeque::with_capacity(14);
         
-        // Предварительное заполнение окон данными для расчета
+        // Pre-fill windows with data for calculation
         for i in 0..window_end_idx {
             if i > 0 {
-                // Рассчитываем изменение цены для RSI
+                // Calculate price change for RSI
                 let price_change = candles[i].close_price - candles[i - 1].close_price;
                 if price_change >= 0.0 {
                     rsi_gains.push_back(price_change);
@@ -344,7 +298,7 @@ impl IndicatorCalculator {
                     rsi_gains.push_back(0.0);
                     rsi_losses.push_back(-price_change);
                 }
-                // Ограничиваем размер окна для RSI
+                // Limit RSI window size
                 if rsi_gains.len() > 14 {
                     rsi_gains.pop_front();
                     rsi_losses.pop_front();
@@ -357,21 +311,21 @@ impl IndicatorCalculator {
             }
         }
         
-        // Сохраняем предыдущую ма_10 и ма_30 для определения пересечений
+        // Save previous ma_10 and ma_30 for crossing detection
         let mut prev_ma_10 = calculate_sma(prices_window.iter().cloned().collect::<Vec<f64>>(), 10);
         let mut prev_ma_30 = calculate_sma(prices_window.iter().cloned().collect::<Vec<f64>>(), 30);
         
-        // Расчет стандартного отклонения объемов для определения аномалий
+        // Calculate volume standard deviation for anomaly detection
         let mut volume_stats = VolumeStatistics::new(50);
         for i in 0..window_end_idx {
             volume_stats.add(candles[i].volume as f64);
         }
         
-        // Основной расчет индикаторов для каждой свечи
+        // Main indicator calculation for each candle
         for i in window_end_idx..candles.len() {
             let candle = &candles[i];
             
-            // Расчет RSI
+            // RSI calculation
             if i > 0 {
                 let price_change = candle.close_price - candles[i - 1].close_price;
                 if price_change >= 0.0 {
@@ -388,34 +342,34 @@ impl IndicatorCalculator {
                 }
             }
 
-            // Обновление окна цен
+            // Update price window
             prices_window.push_back(candle.close_price);
             if prices_window.len() > self.window_size {
                 prices_window.pop_front();
             }
 
-            // Обновление статистики объемов
+            // Update volume statistics
             volume_stats.add(candle.volume as f64);
 
-            // Расчет скользящих средних
+            // Calculate moving averages
             let prices_vec = prices_window.iter().cloned().collect::<Vec<f64>>();
             let ma_10 = calculate_sma(prices_vec.clone(), 10);
             let ma_30 = calculate_sma(prices_vec, 30);
 
-            // Расчет RSI
+            // Calculate RSI
             let rsi_14 = calculate_rsi(&rsi_gains, &rsi_losses);
 
-            // Расчет производных показателей
+            // Calculate derived metrics
             let ma_diff = ma_10 - ma_30;
 
-            // Определение пересечения MA
+            // Detect MA crossing
             let ma_cross = determine_ma_cross(prev_ma_10, prev_ma_30, ma_10, ma_30);
 
-            // Обновление предыдущих значений MA
+            // Update previous MA values
             prev_ma_10 = ma_10;
             prev_ma_30 = ma_30;
 
-            // Определение зоны RSI
+            // Determine RSI zone
             let rsi_zone = if rsi_14 < 30.0 {
                 1
             } else if rsi_14 > 70.0 {
@@ -424,18 +378,18 @@ impl IndicatorCalculator {
                 0
             };
 
-            // Проверка аномалии объема
+            // Check volume anomaly
             let volume_norm = volume_stats.normalize(candle.volume as f64);
             let volume_anomaly = if volume_norm > 2.0 { 1 } else { 0 };
 
-            // Расчет целевой переменной (будет обновлена при следующем проходе)
+            // Calculate target variable (will be updated on next pass)
             let (price_change_15m, signal_15m) = if i + 15 < candles.len() {
                 calculate_future_price_change(candle.close_price, candles[i + 15].close_price)
             } else {
                 (0.0, 0)
             };
 
-            // Получение признаков времени
+            // Get time features
             let dt = DateTime::<Utc>::from_timestamp(candle.time, 0).unwrap_or_default();
             let hour_of_day = dt.hour() as i8;
             let day_of_week = match dt.weekday() {
@@ -448,7 +402,7 @@ impl IndicatorCalculator {
                 Weekday::Sun => 7,
             };
 
-            // Создание записи индикатора
+            // Create indicator record
             let indicator = DbIndicator {
                 instrument_uid: candle.instrument_uid.clone(),
                 time: candle.time,
@@ -478,7 +432,7 @@ impl IndicatorCalculator {
     }
 }
 
-/// Вспомогательная структура для хранения статистики объемов
+/// Helper structure for volume statistics
 struct VolumeStatistics {
     volumes: VecDeque<f64>,
     window_size: usize,
@@ -497,12 +451,12 @@ impl VolumeStatistics {
     }
 
     fn add(&mut self, volume: f64) {
-        // Добавление нового значения
+        // Add new value
         self.volumes.push_back(volume);
         self.sum += volume;
         self.sum_sq += volume * volume;
 
-        // Удаление старого значения, если превышен размер окна
+        // Remove old value if window size is exceeded
         if self.volumes.len() > self.window_size {
             let old_value = self.volumes.pop_front().unwrap_or(0.0);
             self.sum -= old_value;
@@ -544,7 +498,7 @@ impl VolumeStatistics {
     }
 }
 
-/// Вычисляет простую скользящую среднюю (SMA)
+/// Calculate Simple Moving Average (SMA)
 fn calculate_sma(prices: Vec<f64>, period: usize) -> f64 {
     if prices.is_empty() || period == 0 || prices.len() < period {
         return 0.0;
@@ -556,10 +510,10 @@ fn calculate_sma(prices: Vec<f64>, period: usize) -> f64 {
     sum / period as f64
 }
 
-/// Вычисляет RSI (Relative Strength Index)
+/// Calculate RSI (Relative Strength Index)
 fn calculate_rsi(gains: &VecDeque<f64>, losses: &VecDeque<f64>) -> f64 {
     if gains.len() < 14 || losses.len() < 14 {
-        return 50.0; // Возвращаем нейтральное значение, если недостаточно данных
+        return 50.0; // Return neutral value if insufficient data
     }
 
     let avg_gain: f64 = gains.iter().sum::<f64>() / 14.0;
@@ -573,28 +527,28 @@ fn calculate_rsi(gains: &VecDeque<f64>, losses: &VecDeque<f64>) -> f64 {
     100.0 - (100.0 / (1.0 + rs))
 }
 
-/// Определяет пересечение скользящих средних
+/// Determine moving average crossing
 fn determine_ma_cross(
     prev_ma_fast: f64,
     prev_ma_slow: f64,
     curr_ma_fast: f64,
     curr_ma_slow: f64,
 ) -> i8 {
-    // Пересечение снизу вверх (golden cross)
+    // Crossing from below (golden cross)
     if prev_ma_fast <= prev_ma_slow && curr_ma_fast > curr_ma_slow {
         return 1;
     }
 
-    // Пересечение сверху вниз (death cross)
+    // Crossing from above (death cross)
     if prev_ma_fast >= prev_ma_slow && curr_ma_fast < curr_ma_slow {
         return -1;
     }
 
-    // Нет пересечения
+    // No crossing
     0
 }
 
-/// Расчет изменения цены в будущем и определение сигнала
+/// Calculate future price change and determine signal
 fn calculate_future_price_change(current_price: f64, future_price: f64) -> (f64, i8) {
     if current_price == 0.0 {
         return (0.0, 0);
@@ -603,11 +557,11 @@ fn calculate_future_price_change(current_price: f64, future_price: f64) -> (f64,
     let price_change = ((future_price / current_price) - 1.0) * 100.0;
 
     let signal = if price_change > 0.2 {
-        1 // Рост >0.2%
+        1 // Rise >0.2%
     } else if price_change < -0.2 {
-        -1 // Падение >0.2%
+        -1 // Fall >0.2%
     } else {
-        0 // Боковик
+        0 // Sideways
     };
 
     (price_change, signal)

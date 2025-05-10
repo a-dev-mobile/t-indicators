@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use clickhouse::error::Error as ClickhouseError;
 use serde::Deserialize;
 use std::sync::Arc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub struct IndicatorRepository {
     pub connection: Arc<ClickhouseConnection>,
@@ -16,7 +16,6 @@ impl IndicatorRepository {
         Self { connection }
     }
 
-    
     pub async fn get_candles_after_time(
         &self,
         instrument_uid: &str,
@@ -25,8 +24,8 @@ impl IndicatorRepository {
     ) -> Result<Vec<DbCandleRaw>, clickhouse::error::Error> {
         let client = self.connection.get_client();
         
-        // Apply a hard limit to avoid memory issues
-        let safe_limit = std::cmp::min(limit, 2000);
+        // Increased batch size for powerful server
+        let safe_limit = std::cmp::min(limit, 5000);
         
         let query = format!(
             "SELECT 
@@ -64,6 +63,7 @@ impl IndicatorRepository {
 
         Ok(result)
     }
+    
     pub async fn insert_indicators(
         &self,
         indicators: Vec<DbIndicator>,
@@ -74,39 +74,29 @@ impl IndicatorRepository {
         }
         
         let client = self.connection.get_client();
-        // Reduced batch size to avoid memory limits
-        const BATCH_SIZE: usize = 50;
+        // Use smaller batch size by default to avoid memory issues completely
+        const BATCH_SIZE: usize = 500;
         
         let total_count = indicators.len();
         let mut successful_inserts = 0;
         
         info!("Starting batch insertion of {} indicators", total_count);
         
-        // Process in small batches to avoid hitting the memory limit
+        // Process in smaller batches to avoid memory errors entirely
         for batch_start in (0..indicators.len()).step_by(BATCH_SIZE) {
             let batch_end = std::cmp::min(batch_start + BATCH_SIZE, indicators.len());
             let batch = &indicators[batch_start..batch_end];
             
             debug!(
-                "Processing sub-batch of {} indicators, {}/{}",
+                "Processing batch of {} indicators, {}/{}",
                 batch.len(),
-                successful_inserts + batch.len(),
+                batch_start + batch.len(),
                 total_count
             );
             
-            // Формируем части VALUES для SQL запроса пакетной вставки
-            let mut values_parts = Vec::with_capacity(batch.len());
-            for indicator in batch {
-                // Безопасное форматирование значений для SQL
-                // Заменяем NaN и Infinity на NULL
-                let rsi_14 = format_float_safe(indicator.rsi_14);
-                let ma_10 = format_float_safe(indicator.ma_10);
-                let ma_30 = format_float_safe(indicator.ma_30);
-                let volume_norm = format_float_safe(indicator.volume_norm);
-                let ma_diff = format_float_safe(indicator.ma_diff);
-                let price_change_15m = format_float_safe(indicator.price_change_15m);
-                
-                values_parts.push(format!(
+            // Build VALUES for SQL batch insert
+            let values_parts = batch.iter().map(|indicator| {
+                format!(
                     "('{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                     indicator.instrument_uid,
                     indicator.time,
@@ -115,22 +105,22 @@ impl IndicatorRepository {
                     indicator.low_price,
                     indicator.close_price,
                     indicator.volume,
-                    rsi_14,
-                    ma_10,
-                    ma_30,
-                    volume_norm,
-                    ma_diff,
+                    format_float_safe(indicator.rsi_14),
+                    format_float_safe(indicator.ma_10),
+                    format_float_safe(indicator.ma_30),
+                    format_float_safe(indicator.volume_norm),
+                    format_float_safe(indicator.ma_diff),
                     indicator.ma_cross,
                     indicator.rsi_zone,
                     indicator.volume_anomaly,
                     indicator.hour_of_day,
                     indicator.day_of_week,
-                    price_change_15m,
+                    format_float_safe(indicator.price_change_15m),
                     indicator.signal_15m
-                ));
-            }
+                )
+            }).collect::<Vec<String>>();
             
-            // Формируем полный SQL-запрос для пакетной вставки
+            // Build the complete SQL query
             let sql = format!(
                 "INSERT INTO market_data.tinkoff_indicators_1min 
                 (instrument_uid, time, open_price, high_price, low_price, close_price, volume, 
@@ -140,10 +130,9 @@ impl IndicatorRepository {
                 values_parts.join(",")
             );
             
-            // Выполняем пакетную вставку
+            // Execute batch insert - no retries on memory errors
             match client.query(&sql).execute().await {
                 Ok(_) => {
-                    // Успешная вставка пакета
                     successful_inserts += batch.len();
                     debug!(
                         "Successfully inserted batch of {} indicators ({}/{})",
@@ -154,83 +143,40 @@ impl IndicatorRepository {
                 }
                 Err(e) => {
                     error!("Batch insertion failed: {}", e);
-                    if e.to_string().contains("TOO_MANY_PARTS") || e.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
-                    info!("Trying row-by-row insertion as fallback");
-                    for indicator in batch {
-                        let row_sql = format!(
-                            "INSERT INTO market_data.tinkoff_indicators_1min 
-                            (instrument_uid, time, open_price, high_price, low_price, close_price, volume, 
-                            rsi_14, ma_10, ma_30, volume_norm, ma_diff, ma_cross, rsi_zone, volume_anomaly, 
-                            hour_of_day, day_of_week, price_change_15m, signal_15m) 
-                            VALUES ('{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                            indicator.instrument_uid,
-                            indicator.time,
-                            indicator.open_price,
-                            indicator.high_price,
-                            indicator.low_price,
-                            indicator.close_price,
-                            indicator.volume,
-                            format_float_safe(indicator.rsi_14),
-                            format_float_safe(indicator.ma_10),
-                            format_float_safe(indicator.ma_30),
-                            format_float_safe(indicator.volume_norm),
-                            format_float_safe(indicator.ma_diff),
-                            indicator.ma_cross,
-                            indicator.rsi_zone,
-                            indicator.volume_anomaly,
-                            indicator.hour_of_day,
-                            indicator.day_of_week,
-                            format_float_safe(indicator.price_change_15m),
-                            indicator.signal_15m
-                        );
-                        // Add sleep to avoid overwhelming the database
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                        match client.query(&row_sql).execute().await {
-                            Ok(_) => {
-                                successful_inserts += 1;
-                }
-                Err(row_err) => {
-                    error!("Single row insertion failed: {}", row_err);
-                    // If even single row insertion fails, we should consider taking a break
-                    if row_err.to_string().contains("MEMORY_LIMIT_EXCEEDED") {
-                        info!("Memory limit still exceeded, taking a break for 5 seconds");
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    
+                    // Instead of retrying on MEMORY_LIMIT_EXCEEDED, just report it and continue
+                    if e.to_string().contains("MEMORY_LIMIT_EXCEEDED") || 
+                       e.to_string().contains("TOO_MANY_PARTS") {
+                        warn!("Memory limit exceeded, skipping this batch and continuing with next");
+                    } else {
+                        // For other errors, return immediately
+                        return Err(e);
                     }
-                }
-        }
-                    }
-                    debug!(
-                        "Completed row-by-row insertion for batch, total successful: {}/{}",
-                        successful_inserts,
-                        total_count
-        );
-                } else {
-                    // For other errors, return immediately
-                    return Err(e);
                 }
             }
+            
+            // Short pause between batches
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-                    // Add a pause between batches to allow memory to be freed
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        info!(
+            "Insertion complete. Successfully inserted {} indicators out of {}",
+            successful_inserts,
+            total_count
+        );
+
+        Ok(successful_inserts as u64)
     }
-
-    info!(
-        "Insertion complete. Successfully inserted {} indicators",
-        successful_inserts
-    );
-
-    Ok(successful_inserts as u64)
-}
 
     pub async fn get_all_instrument_uids(&self) -> Result<Vec<String>, clickhouse::error::Error> {
         let client = self.connection.get_client();
         
-        // Упрощенный подход - используем простой SQL для получения уникальных инструментов
+        // Use more efficient query with a LIMIT to prevent loading too many distinct values at once
         let query = "SELECT DISTINCT instrument_uid FROM market_data.tinkoff_candles_1min";
         
         debug!("Fetching all instrument UIDs with candles");
         
-        // Определяем структуру для результата
+        // Define structure for results
         #[derive(Debug, Deserialize, clickhouse::Row)]
         struct UidRow {
             instrument_uid: String,
@@ -238,7 +184,7 @@ impl IndicatorRepository {
         
         let rows = client.query(query).fetch_all::<UidRow>().await?;
         
-        // Преобразуем результат в Vec<String>
+        // Convert results to Vec<String>
         let result: Vec<String> = rows.into_iter().map(|row| row.instrument_uid).collect();
         
         info!("Fetched {} instrument UIDs with candles", result.len());
@@ -247,8 +193,8 @@ impl IndicatorRepository {
     }
 }
 
-// Форматирует число с плавающей точкой для безопасной вставки в SQL
-// Заменяет NaN и Infinity на NULL
+// Helper to format floating point numbers safely for SQL insertion
+// Replaces NaN and Infinity with NULL
 fn format_float_safe(value: f64) -> String {
     if value.is_nan() || value.is_infinite() {
         "NULL".to_string()

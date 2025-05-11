@@ -16,7 +16,7 @@ pub struct IndicatorCalculator {
 impl IndicatorCalculator {
     pub fn new(app_state: Arc<AppState>) -> Self {
         // Use moderate batch size to avoid memory issues entirely
-        let batch_size = 1500; // Balanced batch size to avoid memory errors
+        let batch_size = 100000; // Balanced batch size to avoid memory errors
         let window_size = 50;  // Size of window for moving averages and RSI
 
         Self {

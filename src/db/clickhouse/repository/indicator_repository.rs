@@ -25,7 +25,7 @@ impl IndicatorRepository {
         let client = self.connection.get_client();
         
         // Increased batch size for powerful server
-        let safe_limit = std::cmp::min(limit, 5000);
+        let safe_limit = std::cmp::min(limit, 10000);
         
         let query = format!(
             "SELECT 
@@ -73,10 +73,11 @@ impl IndicatorRepository {
             return Ok(0);
         }
         
-        let client = self.connection.get_client();
-        // Use smaller batch size by default to avoid memory issues completely
-        const BATCH_SIZE: usize = 500;
+    let client = self.connection.get_client()
+        .with_option("async_insert", "1")
+        .with_option("wait_for_async_insert", "0");
         
+    const BATCH_SIZE: usize = 100000;
         let total_count = indicators.len();
         let mut successful_inserts = 0;
         
@@ -95,43 +96,24 @@ impl IndicatorRepository {
             );
             
             // Build VALUES for SQL batch insert
-            let values_parts = batch.iter().map(|indicator| {
-                format!(
-                    "('{}', {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-                    indicator.instrument_uid,
-                    indicator.time,
-                    indicator.open_price,
-                    indicator.high_price,
-                    indicator.low_price,
-                    indicator.close_price,
-                    indicator.volume,
-                    format_float_safe(indicator.rsi_14),
-                    format_float_safe(indicator.ma_10),
-                    format_float_safe(indicator.ma_30),
-                    format_float_safe(indicator.volume_norm),
-                    format_float_safe(indicator.ma_diff),
-                    indicator.ma_cross,
-                    indicator.rsi_zone,
-                    indicator.volume_anomaly,
-                    indicator.hour_of_day,
-                    indicator.day_of_week,
-                    format_float_safe(indicator.price_change_15m),
-                    indicator.signal_15m
-                )
-            }).collect::<Vec<String>>();
+        let mut insert = match client.insert("market_data.tinkoff_indicators_1min") {
+            Ok(i) => i,
+            Err(e) => {
+                error!("Failed to create insert context: {}", e);
+                continue;
+            }
+        };
             
+        for indicator in batch {
+            if let Err(e) = insert.write(indicator).await {
+                error!("Failed to write indicator: {}", e);
             // Build the complete SQL query
-            let sql = format!(
-                "INSERT INTO market_data.tinkoff_indicators_1min 
-                (instrument_uid, time, open_price, high_price, low_price, close_price, volume, 
-                 rsi_14, ma_10, ma_30, volume_norm, ma_diff, ma_cross, rsi_zone, volume_anomaly, 
-                 hour_of_day, day_of_week, price_change_15m, signal_15m) 
-                VALUES {}",
-                values_parts.join(",")
-            );
+                continue;
+            }
+        }
             
             // Execute batch insert - no retries on memory errors
-            match client.query(&sql).execute().await {
+        match insert.end().await {
                 Ok(_) => {
                     successful_inserts += batch.len();
                     debug!(
@@ -148,9 +130,7 @@ impl IndicatorRepository {
                     if e.to_string().contains("MEMORY_LIMIT_EXCEEDED") || 
                        e.to_string().contains("TOO_MANY_PARTS") {
                         warn!("Memory limit exceeded, skipping this batch and continuing with next");
-                    } else {
                         // For other errors, return immediately
-                        return Err(e);
                     }
                 }
             }
